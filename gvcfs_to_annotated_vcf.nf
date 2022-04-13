@@ -310,6 +310,7 @@ process joint_genotype {
 //
 
 //VQSR
+/*
 process vqsr {
    //tag ""
 
@@ -425,6 +426,153 @@ process vqsr {
    tabix -f ${indel_vqsr_fixed_vcf}
    '''
 }
+*/
+process vqsr {
+   //tag ""
+
+   cpus params.vqsr_cpus
+   memory { params.vqsr_mem.plus(1).plus(task.attempt.minus(1).multiply(32))+' GB' }
+   time { task.attempt == 2 ? '72h' : params.vqsr_timeout }
+   errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
+   maxRetries 1
+
+   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
+   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*.tranches'
+   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*_plots.R'
+   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*.recal.vcf'
+   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*_sites.vcf.g*'
+
+   input:
+   path(vcfs) from genotyped_vcfs.toSortedList( { a,b -> (a.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() <=> (b.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() } )
+   path(vcf_indices) from genotyped_vcf_indices.toSortedList( { a,b -> (a.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() <=> (b.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() } )
+   path ref
+   path ref_dict
+   path ref_fai
+   path known_hapmap
+   path known_hapmap_idx
+   path known_omni
+   path known_omni_idx
+   path known_tgp
+   path known_tgp_idx
+   path known_dbsnp
+   path known_dbsnp_idx
+   path known_mills_indels
+   path known_mills_indels_idx
+
+   output:
+   tuple path("${params.run_name}_GATK_SNP_recal.stderr"), path("${params.run_name}_GATK_SNP_recal.stdout"), path("${params.run_name}_GATK_SNP_VQSR.stderr"), path("${params.run_name}_GATK_SNP_VQSR.stdout"), path("${params.run_name}_GATK_INDEL_recal.stderr"), path("${params.run_name}_GATK_INDEL_recal.stdout"), path("${params.run_name}_GATK_INDEL_VQSR.stderr"), path("${params.run_name}_GATK_INDEL_VQSR.stdout"), path("${params.run_name}_bcftools_concat_jgVCFs.stderr"), path("${params.run_name}_bcftools_concat_jgVCFs.stdout"), path("${params.run_name}_bcftools_annotate_VQSR.stderr"), path("${params.run_name}_bcftools_annotate_VQSR.stdout") into vqsr_logs
+   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_plots.R"), path("${params.run_name}_SNPVQSR_${params.snp_sens}.recal.vcf"), path("${params.run_name}_SNPVQSR_${params.snp_sens}.tranches") into snpvqsr_aux_output
+   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_plots.R"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.recal.vcf"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.tranches") into indelvqsr_aux_output
+   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_sites.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_sites.vcf.gz.tbi") into snp_vqsr_vcf
+   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_sites.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_sites.vcf.gz.tbi") into indel_vqsr_vcf
+   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz.tbi") into final_vqsr_vcf
+
+   shell:
+   vqsr_retry_mem = params.vqsr_mem.plus(task.attempt.minus(1).multiply(32))
+   invcf_list = vcfs
+      .collect { vcf -> "-V ${vcf} " }
+      .join()
+   snp_recal_params = """-mode SNP \
+    --rscript-file ${params.run_name}_SNPVQSR_${params.snp_sens}_plots.R \
+    -O ${params.run_name}_SNPVQSR_${params.snp_sens}.recal.vcf \
+    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}.tranches \
+    -an QD -an DP -an FS -an SOR -an MQ -an ReadPosRankSum -an MQRankSum \
+    --resource:hapmap,known=false,training=true,truth=true,prior=15.0 \
+    ${known_hapmap} \
+    --resource:omni,known=false,training=true,truth=true,prior=12.0 \
+    ${known_omni} \
+    --resource:1000G,known=false,training=true,truth=false,prior=10.0 \
+    ${known_tgp} \
+    --resource:dbsnp,known=true,training=false,truth=false,prior=7.0 \
+    ${known_dbsnp} \
+    -tranche 100.0 -tranche 99.9 -tranche 99.5 -tranche 99.0 \
+    -tranche 98.5 -tranche 98.0 -tranche 97.5 -tranche 97.0 \
+    --max-gaussians ${params.snp_mvn_k}"""
+   snp_vqsr_params = """-mode SNP \
+    --recal-file ${params.run_name}_SNPVQSR_${params.snp_sens}.recal.vcf \
+    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}.tranches \
+    --ts-filter-level ${params.snp_sens}"""
+   indel_recal_params = """-mode INDEL \
+    --rscript-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_plots.R \
+    -O ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.recal.vcf \
+    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.tranches \
+    -an QD -an DP -an FS -an SOR -an MQ -an ReadPosRankSum -an MQRankSum \
+    --resource:mills,known=false,training=true,truth=true,prior=12.0 \
+    ${known_mills_indels} \
+    --resource:dbsnp,known=true,training=false,truth=false,prior=7.0 \
+    ${known_dbsnp} \
+    -tranche 100.0 -tranche 99.9 -tranche 99.5 -tranche 99.0 \
+    -tranche 98.5 -tranche 98.0 -tranche 97.5 -tranche 97.0 \
+    --max-gaussians ${params.indel_mvn_k}"""
+   indel_vqsr_params = """-mode INDEL \
+    --recal-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.recal.vcf \
+    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.tranches \
+    --ts-filter-level ${params.indel_sens}"""
+   '''
+   module load !{params.mod_bcftools}
+   module load !{params.mod_htslib}
+   module load !{params.mod_R}
+   module load !{params.mod_gatk4}
+   #Generate the sites-only input VCFs:
+   invcf_list="!{invcf_list}"
+   jgvcfs=${invcf_list//-V /};
+   invcf_list="";
+   rm_list="";
+   for fullvcf in ${jgvcfs};
+      do
+      sitesvcf=${fullvcf//.vcf.gz/_sites.vcf.gz};
+      echo "Generating sites-only VCF from ${fullvcf}"
+      date
+      bcftools view -G -Oz -o ${sitesvcf} ${fullvcf}
+      tabix -f ${sitesvcf}
+      invcf_list="${invcf_list}-V ${sitesvcf} "
+      rm_list="${rm_list}${sitesvcf} "
+      rm_list="${rm_list}${sitesvcf}.tbi "
+      date
+   done
+   #SNP VQSR output:
+   snp_vqsr_vcf="!{params.run_name}_SNPVQSR_!{params.snp_sens}_sites.vcf.gz"
+   #Run SNP VQSR:
+   echo "SNP mode GATK VariantRecalibrator"
+   date
+   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" VariantRecalibrator -R !{ref} !{snp_recal_params} ${invcf_list} 2> !{params.run_name}_GATK_SNP_recal.stderr > !{params.run_name}_GATK_SNP_recal.stdout
+   date
+   echo "SNP mode GATK ApplyVQSR"
+   date
+   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" ApplyVQSR -R !{ref} !{snp_vqsr_params} ${invcf_list} -O ${snp_vqsr_vcf} 2> !{params.run_name}_GATK_SNP_VQSR.stderr > !{params.run_name}_GATK_SNP_VQSR.stdout
+   date
+   tabix -f ${snp_vqsr_vcf}
+   #INDEL VQSR output:
+   indel_vqsr_vcf="!{params.run_name}_SNPVQSR_!{params.snp_sens}_INDELVQSR_!{params.indel_sens}_sites.vcf.gz"
+   #Run INDEL VQSR:
+   echo "INDEL mode GATK VariantRecalibrator"
+   date
+   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" VariantRecalibrator -R !{ref} !{indel_recal_params} -V ${snp_vqsr_vcf} 2> !{params.run_name}_GATK_INDEL_recal.stderr > !{params.run_name}_GATK_INDEL_recal.stdout
+   date
+   echo "INDEL mode GATK ApplyVQSR"
+   date
+   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" ApplyVQSR -R !{ref} !{indel_vqsr_params} -V ${snp_vqsr_vcf} -O ${indel_vqsr_vcf} 2> !{params.run_name}_GATK_INDEL_VQSR.stderr > !{params.run_name}_GATK_INDEL_VQSR.stdout
+   date
+   tabix -f ${indel_vqsr_vcf}
+   #Concatenate the jointly genotyped VCFs together so we can annotate:
+   echo "Concatenating jointly genotyped VCFs"
+   date
+   bcftools concat -Oz -o !{params.run_name}_concat.vcf.gz ${jgvcfs[@]} 2> !{params.run_name}_bcftools_concat_jgVCFs.stderr > !{params.run_name}_bcftools_concat_jgVCFs.stdout
+   date
+   tabix -f !{params.run_name}_concat.vcf.gz
+   rm_list="${rm_list}!{params.run_name}_concat.vcf.gz "
+   rm_list="${rm_list}!{params.run_name}_concat.vcf.gz.tbi "
+   #Now annotate with the the results of VQSR:
+   final_vqsr_vcf="!{params.run_name}_SNPVQSR_!{params.snp_sens}_INDELVQSR_!{params.indel_sens}.vcf.gz"
+   echo "Adding VQSR info from FILTER and INFO columns to concatenated VCF"
+   date
+   bcftools annotate -a ${indel_vqsr_vcf} -c FILTER,INFO -Oz -o ${final_vqsr_vcf} !{params.run_name}_concat.vcf.gz 2> !{params.run_name}_bcftools_annotate_VQSR.stderr > !{params.run_name}_bcftools_annotate_VQSR.stdout
+   date
+   tabix -f ${final_vqsr_vcf}
+   #Clean up:
+   rm ${rm_list[@]}
+   '''
+}
 
 //Split into the major chromosomes for faster merging and annotation downstream:
 //Slight change 2022/03/15: Filter out any ALTs missing from genotypes before
@@ -441,6 +589,7 @@ process perchrom_vcfs {
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
+   publishDir path: "${params.output_dir}/modern_VCFs", mode: 'copy', pattern: '*_chr*.vcf.g{z,z.tbi}'
 
    input:
    tuple path(invcf), path(invcfidx) from final_vqsr_vcf
