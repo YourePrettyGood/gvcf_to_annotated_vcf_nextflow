@@ -189,7 +189,7 @@ process index_gvcfs {
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
-   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,log}'
+   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
    tuple val(sample_id), val(sample), path("${sample}.g.vcf.gz") from gvcfs
@@ -216,7 +216,7 @@ process combine_tierone {
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
-   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,log}'
+   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
    tuple val(batch_id), path(ingvcfs) from gvcfs_tobatch.groupTuple(by: 0, size: params.batch_size, remainder: true, sort: true)
@@ -253,7 +253,7 @@ process combine_final {
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
-   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,log}'
+   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
    tuple val(ref_chunk), path(ingvcfs), path(regions) from tierone_gvcfs.groupTuple(by: 0, sort: {a,b -> (a.getSimpleName() =~ ~/^.+_batch(\p{Digit}+)_region\p{Digit}+$/)[0][1].toInteger() <=> (b.getSimpleName() =~ ~/^.+_batch(\p{Digit}+)_region\p{Digit}+$/)[0][1].toInteger()}).ifEmpty( { error "groupTuple on tierone_gvcfs is empty" } ).combine(scattered_regions_tojoin, by: 0).ifEmpty( { error "combine of tierone batch gvcfs by ref region with region files was empty" } )
