@@ -4,8 +4,8 @@
  *  GATK CombineGVCFs (in batches) -> GATK CombineGVCFs (merge batches) ->  *
  *  GATK GenotypeGVCFs (scattered) -> GATK VariantRecalibrator (gathered) ->*
  *  GATK ApplyVQSR (then repeat these two steps again for indels) ->        * 
- *  bcftools +scatter (by major chromosome) -> bcftools merge (archaics) -> *
- *  bcftools annotate (dbSNP)                                               *
+ *  bcftools +scatter (by major chromosome) -> bcftools annotate (dbSNP) -> *
+ *  bcftools merge (archaics) (optional)                                    *
  * QC steps:                                                                *
  *  ValidateVariants (on final VCF)                                         */
 
@@ -146,39 +146,44 @@ num_scattered = file(params.scattered_bed_fofn, checkIfExists: true)
    .readLines()
    .size()
 
-//Set up the channels of Archaic per-chromosome VCFs and their indices:
-Channel
-   .fromPath(params.arcvcf_glob, checkIfExists: true)
-   .ifEmpty { error "Unable to find archaic VCFs matching glob: ${params.arcvcf_glob}" }
-   .map { a -> [ (a.getSimpleName() =~ params.arc_regex)[0][1], a] }
-   .filter { params.chrom_list.tokenize(',').contains(it[0]) }
-   .tap { arc_vcfs }
-   .subscribe { println "Added ${it[1]} to arc_vcfs channel" }
+//Optionally merge with archaics (default: skip):
+params.add_archaics = false
 
-Channel
-   .fromPath(params.arcvcf_glob+'.tbi', checkIfExists: true)
-   .ifEmpty { error "Unable to find archaic VCF indices matching glob: ${params.arcvcf_glob}.tbi" }
-   .map { a -> [ (a.getSimpleName() =~ params.arc_regex)[0][1], a] }
-   .filter { params.chrom_list.tokenize(',').contains(it[0]) }
-   .tap { arc_vcf_indices }
-   .subscribe { println "Added ${it[1]} to arc_vcf_indices channel" }
+if (params.add_archaics) {
+   //Set up the channels of Archaic per-chromosome VCFs and their indices:
+   Channel
+      .fromPath(params.arcvcf_glob, checkIfExists: true)
+      .ifEmpty { error "Unable to find archaic VCFs matching glob: ${params.arcvcf_glob}" }
+      .map { a -> [ (a.getSimpleName() =~ params.arc_regex)[0][1], a] }
+      .filter { params.chrom_list.tokenize(',').contains(it[0]) }
+      .tap { arc_vcfs }
+      .subscribe { println "Added ${it[1]} to arc_vcfs channel" }
 
-//Set up the channels of PanTro EPO per-chromosome VCFs and their indices:
-Channel
-   .fromPath(params.pantrovcf_glob, checkIfExists: true)
-   .ifEmpty { error "Unable to find PanTro EPO VCFs matching glob: ${params.pantrovcf_glob}" }
-   .map { a -> [ (a.getSimpleName() =~ params.pantro_regex)[0][1], a] }
-   .filter { params.chrom_list.tokenize(',').contains(it[0]) }
-   .tap { pantro_vcfs }
-   .subscribe { println "Added ${it[1]} to pantro_vcfs channel" }
+   Channel
+      .fromPath(params.arcvcf_glob+'.tbi', checkIfExists: true)
+      .ifEmpty { error "Unable to find archaic VCF indices matching glob: ${params.arcvcf_glob}.tbi" }
+      .map { a -> [ (a.getSimpleName() =~ params.arc_regex)[0][1], a] }
+      .filter { params.chrom_list.tokenize(',').contains(it[0]) }
+      .tap { arc_vcf_indices }
+      .subscribe { println "Added ${it[1]} to arc_vcf_indices channel" }
 
-Channel
-   .fromPath(params.pantrovcf_glob+'.tbi', checkIfExists: true)
-   .ifEmpty { error "Unable to find PanTro EPO VCF indices matching glob: ${params.pantrovcf_glob}.tbi" }
-   .map { a -> [ (a.getSimpleName() =~ params.pantro_regex)[0][1], a] }
-   .filter { params.chrom_list.tokenize(',').contains(it[0]) }
-   .tap { pantro_vcf_indices }
-   .subscribe { println "Added ${it[1]} to pantro_vcf_indices channel" }
+   //Set up the channels of PanTro EPO per-chromosome VCFs and their indices:
+   Channel
+      .fromPath(params.pantrovcf_glob, checkIfExists: true)
+      .ifEmpty { error "Unable to find PanTro EPO VCFs matching glob: ${params.pantrovcf_glob}" }
+      .map { a -> [ (a.getSimpleName() =~ params.pantro_regex)[0][1], a] }
+      .filter { params.chrom_list.tokenize(',').contains(it[0]) }
+      .tap { pantro_vcfs }
+      .subscribe { println "Added ${it[1]} to pantro_vcfs channel" }
+
+   Channel
+      .fromPath(params.pantrovcf_glob+'.tbi', checkIfExists: true)
+      .ifEmpty { error "Unable to find PanTro EPO VCF indices matching glob: ${params.pantrovcf_glob}.tbi" }
+      .map { a -> [ (a.getSimpleName() =~ params.pantro_regex)[0][1], a] }
+      .filter { params.chrom_list.tokenize(',').contains(it[0]) }
+      .tap { pantro_vcf_indices }
+      .subscribe { println "Added ${it[1]} to pantro_vcf_indices channel" }
+}
 
 process index_gvcfs {
    tag "${sample_id}"
@@ -310,123 +315,6 @@ process joint_genotype {
 //
 
 //VQSR
-/*
-process vqsr {
-   //tag ""
-
-   cpus params.vqsr_cpus
-   memory { params.vqsr_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.vqsr_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
-   maxRetries 1
-
-   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
-   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*.tranches'
-   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*_plots.R'
-   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*.recal.vcf'
-   publishDir path: "${params.output_dir}/VQSR", mode: 'copy', pattern: '*_fixed.vcf.g*'
-
-   input:
-   path(vcfs) from genotyped_vcfs.toSortedList( { a,b -> (a.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() <=> (b.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() } )
-   path(vcf_indices) from genotyped_vcf_indices.toSortedList( { a,b -> (a.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() <=> (b.getSimpleName() =~ ~/^.+_region(\p{Digit}+)$/)[0][1].toInteger() } )
-   path ref
-   path ref_dict
-   path ref_fai
-   path known_hapmap
-   path known_hapmap_idx
-   path known_omni
-   path known_omni_idx
-   path known_tgp
-   path known_tgp_idx
-   path known_dbsnp
-   path known_dbsnp_idx
-   path known_mills_indels
-   path known_mills_indels_idx
-
-   output:
-   tuple path("${params.run_name}_GATK_SNP_recal.stderr"), path("${params.run_name}_GATK_SNP_recal.stdout"), path("${params.run_name}_GATK_SNP_VQSR.stderr"), path("${params.run_name}_GATK_SNP_VQSR.stdout"), path("${params.run_name}_GATK_INDEL_recal.stderr"), path("${params.run_name}_GATK_INDEL_recal.stdout"), path("${params.run_name}_GATK_INDEL_VQSR.stderr"), path("${params.run_name}_GATK_INDEL_VQSR.stdout") into vqsr_logs
-   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_plots.R"), path("${params.run_name}_SNPVQSR_${params.snp_sens}.recal.vcf"), path("${params.run_name}_SNPVQSR_${params.snp_sens}.tranches") into snpvqsr_aux_output
-   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_plots.R"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.recal.vcf"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.tranches") into indelvqsr_aux_output
-   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_fixed.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_fixed.vcf.gz.tbi") into snp_vqsr_vcf
-   tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_fixed.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_fixed.vcf.gz.tbi") into final_vqsr_vcf
-
-   shell:
-   vqsr_retry_mem = params.vqsr_mem.plus(task.attempt.minus(1).multiply(16))
-   firstvcf = vcfs
-      .first()
-   invcf_list = vcfs
-      .collect { vcf -> "-V ${vcf} " }
-      .join()
-   snp_recal_params = """-mode SNP \
-    --rscript-file ${params.run_name}_SNPVQSR_${params.snp_sens}_plots.R \
-    -O ${params.run_name}_SNPVQSR_${params.snp_sens}.recal.vcf \
-    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}.tranches \
-    -an QD -an DP -an FS -an SOR -an MQ -an ReadPosRankSum -an MQRankSum \
-    --resource:hapmap,known=false,training=true,truth=true,prior=15.0 \
-    ${known_hapmap} \
-    --resource:omni,known=false,training=true,truth=true,prior=12.0 \
-    ${known_omni} \
-    --resource:1000G,known=false,training=true,truth=false,prior=10.0 \
-    ${known_tgp} \
-    --resource:dbsnp,known=true,training=false,truth=false,prior=7.0 \
-    ${known_dbsnp} \
-    -tranche 100.0 -tranche 99.9 -tranche 99.5 -tranche 99.0 \
-    -tranche 98.5 -tranche 98.0 -tranche 97.5 -tranche 97.0 \
-    --max-gaussians ${params.snp_mvn_k}"""
-   snp_vqsr_params = """-mode SNP \
-    --recal-file ${params.run_name}_SNPVQSR_${params.snp_sens}.recal.vcf \
-    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}.tranches \
-    --ts-filter-level ${params.snp_sens}"""
-   indel_recal_params = """-mode INDEL \
-    --rscript-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}_plots.R \
-    -O ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.recal.vcf \
-    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.tranches \
-    -an QD -an DP -an FS -an SOR -an MQ -an ReadPosRankSum -an MQRankSum \
-    --resource:mills,known=false,training=true,truth=true,prior=12.0 \
-    ${known_mills_indels} \
-    --resource:dbsnp,known=true,training=false,truth=false,prior=7.0 \
-    ${known_dbsnp} \
-    -tranche 100.0 -tranche 99.9 -tranche 99.5 -tranche 99.0 \
-    -tranche 98.5 -tranche 98.0 -tranche 97.5 -tranche 97.0 \
-    --max-gaussians ${params.indel_mvn_k}"""
-   indel_vqsr_params = """-mode INDEL \
-    --recal-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.recal.vcf \
-    --tranches-file ${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.tranches \
-    --ts-filter-level ${params.indel_sens}"""
-   '''
-   module load !{params.mod_bcftools}
-   module load !{params.mod_htslib}
-   module load !{params.mod_gatk4}
-   module load !{params.mod_R}
-   #SNP VQSR outputs:
-   snp_vqsr_vcf="!{params.run_name}_SNPVQSR_!{params.snp_sens}.vcf.gz"
-   snp_vqsr_fixed_header=${snp_vqsr_vcf//.vcf.gz/_fixedHeader.vcf.gz}
-   snp_vqsr_fixed_vcf=${snp_vqsr_vcf//.vcf.gz/_fixed.vcf.gz}
-   #Run SNP VQSR:
-   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" VariantRecalibrator -R !{ref} !{snp_recal_params} !{invcf_list} 2> !{params.run_name}_GATK_SNP_recal.stderr > !{params.run_name}_GATK_SNP_recal.stdout
-   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" ApplyVQSR -R !{ref} !{snp_vqsr_params} !{invcf_list} -O ${snp_vqsr_vcf} 2> !{params.run_name}_GATK_SNP_VQSR.stderr > !{params.run_name}_GATK_SNP_VQSR.stdout
-   #Fix the VCF header produced by ApplyVQSR:
-   #ApplyVQSR produces a #CHROM line without any FORMAT or SAMPLE column
-   # headers, so we replace that line with one from an input VCF.
-   cat <(bcftools view -h ${snp_vqsr_vcf} | fgrep -v '#CHROM') <(bcftools view -h !{firstvcf} | fgrep '#CHROM') | bgzip -c > ${snp_vqsr_fixed_header}
-   bcftools reheader -h ${snp_vqsr_fixed_header} -o ${snp_vqsr_fixed_vcf} ${snp_vqsr_vcf}
-   tabix -f ${snp_vqsr_fixed_vcf}
-   #INDEL VQSR outputs:
-   indel_vqsr_vcf="!{params.run_name}_SNPVQSR_!{params.snp_sens}_INDELVQSR_!{params.indel_sens}.vcf.gz"
-   indel_vqsr_fixed_header=${indel_vqsr_vcf//.vcf.gz/_fixedHeader.vcf.gz}
-   indel_vqsr_fixed_vcf=${indel_vqsr_vcf//.vcf.gz/_fixed.vcf.gz}
-   #Run INDEL VQSR:
-   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" VariantRecalibrator -R !{ref} !{indel_recal_params} -V ${snp_vqsr_fixed_vcf} 2> !{params.run_name}_GATK_INDEL_recal.stderr > !{params.run_name}_GATK_INDEL_recal.stdout
-   gatk --java-options "-Xmx!{vqsr_retry_mem}g -Xms!{vqsr_retry_mem}g" ApplyVQSR -R !{ref} !{indel_vqsr_params} -V ${snp_vqsr_fixed_vcf} -O ${indel_vqsr_vcf} 2> !{params.run_name}_GATK_INDEL_VQSR.stderr > !{params.run_name}_GATK_INDEL_VQSR.stdout
-   #Fix the VCF header produced by ApplyVQSR:
-   #ApplyVQSR produces a #CHROM line without any FORMAT or SAMPLE column
-   # headers, so we replace that line with one from an input VCF.
-   cat <(bcftools view -h ${indel_vqsr_vcf} | fgrep -v '#CHROM') <(bcftools view -h !{firstvcf} | fgrep '#CHROM') | bgzip -c > ${indel_vqsr_fixed_header}
-   bcftools reheader -h ${indel_vqsr_fixed_header} -o ${indel_vqsr_fixed_vcf} ${indel_vqsr_vcf}
-   tabix -f ${indel_vqsr_fixed_vcf}
-   '''
-}
-*/
 process vqsr {
    //tag ""
 
@@ -613,36 +501,6 @@ process perchrom_vcfs {
    '''
 }
 
-//Merge per-chromosome with the archaics:
-process add_archaic {
-   tag "${chrom}"
-
-   cpus params.archaic_cpus
-   memory { params.archaic_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.archaic_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
-   maxRetries 1
-
-   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
-
-   input:
-   tuple val(chrom), path(invcf), path(arcvcf), path(pantrovcf) from scattered_vcfs.flatMap().map( { a -> [ (a =~ ~/_chr(\p{Alnum}+)[.]vcf[.]gz/)[0][1], a] } ).combine(arc_vcfs, by: 0).combine(pantro_vcfs, by: 0)
-   tuple val(idx_chrom), path(invcfidx), path(arcvcfidx), path(pantrovcfidx) from scattered_vcf_indices.flatMap().map( { a -> [ (a =~ ~/_chr(\p{Alnum}+)[.]vcf[.]gz[.]tbi/)[0][1], a] } ).combine(arc_vcf_indices, by: 0).combine(pantro_vcf_indices, by: 0)
-
-   output:
-   tuple path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stderr"), path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stdout") into addarc_logs
-   tuple val(chrom), path("${params.run_name}_wArchaics_chr${chrom}.vcf.gz") into addarc_vcfs
-   tuple val(idx_chrom), path("${params.run_name}_wArchaics_chr${chrom}.vcf.gz.tbi") into addarc_vcf_indices
-
-   shell:
-   '''
-   module load !{params.mod_bcftools}
-   module load !{params.mod_htslib}
-   bcftools merge -m all -Oz -o !{params.run_name}_wArchaics_chr!{chrom}.vcf.gz !{invcf} !{arcvcf} !{pantrovcf} 2> !{params.run_name}_bcftools_merge_mall_archaics_PanTro_chr!{chrom}.stderr > !{params.run_name}_bcftools_merge_mall_archaics_PanTro_chr!{chrom}.stdout
-   tabix -f !{params.run_name}_wArchaics_chr!{chrom}.vcf.gz
-   '''
-}
-
 //Annotate the per-chromosome VCFs with rsids from dbSNP:
 process annotate_dbsnp {
    tag "${chrom}"
@@ -654,28 +512,61 @@ process annotate_dbsnp {
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
-   publishDir path: "${params.output_dir}/final_VCFs", mode: 'copy', pattern: '*_wArchaics_dbSNP*.vcf.g*'
+   publishDir path: "${params.output_dir}/final_VCFs", mode: 'copy', pattern: '*_dbSNP*.vcf.g*'
 
    input:
-   tuple val(chrom), path(invcf) from addarc_vcfs
-   tuple val(idx_chrom), path(invcfidx) from addarc_vcf_indices
+   tuple val(chrom), path(invcf), path(invcfidx) from scattered_vcfs.flatMap().map({a -> [ (a.getSimpleName() =~ ~/_chr(\p{Alnum}+)$/)[0][1], a ]}).join(scattered_vcf_indices.flatMap().map({a -> [ (a.getSimpleName() =~ ~/_chr(\p{Alnum}+)$/)[0][1], a ]}), by: 0, failOnDuplicate: true, failOnMismatch: true)
    path dbsnp
    path dbsnp_idx
 
    output:
    tuple path("${params.run_name}_bcftools_annotate_chr${chrom}.stderr"), path("${params.run_name}_bcftools_annotate_chr${chrom}.stdout") into dbsnp_logs
-   tuple val(chrom), path("${params.run_name}_wArchaics_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz"), path("${params.run_name}_wArchaics_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz.tbi") into dbsnp_pass_vcf
+   tuple val(chrom), path("${params.run_name}_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz"), path("${params.run_name}_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz.tbi") into dbsnp_vcfs
 
    shell:
    '''
    module load !{params.mod_bcftools}
    module load !{params.mod_htslib}
    inputvcf="!{invcf}"
-   annotatedvcf=${inputvcf//_wArchaics/_wArchaics_dbSNP!{params.dbsnp_build}};
+   annotatedvcf=${inputvcf//_chr/_dbSNP!{params.dbsnp_build}_chr};
    bcftools annotate -a !{dbsnp} -c ID -Oz -o ${annotatedvcf} !{invcf} 2> !{params.run_name}_bcftools_annotate_chr!{chrom}.stderr > !{params.run_name}_bcftools_annotate_chr!{chrom}.stdout
    tabix -f ${annotatedvcf}
    '''
 }
+
+//Merge per-chromosome with the archaics:
+process add_archaic {
+   tag "${chrom}"
+
+   cpus params.archaic_cpus
+   memory { params.archaic_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
+   time { task.attempt == 2 ? '72h' : params.archaic_timeout }
+   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   maxRetries 1
+
+   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
+   publishDir path: "${params.output_dir}/final_VCFs", mode: 'copy', pattern: '*_wArchaics*.vcf.g*'
+
+   when: params.add_archaics
+
+   input:
+   tuple val(chrom), path(invcf), path(invcfidx), path(arcvcf), path(arcvcfidx), path(pantrovcf), path(pantrovcfidx) from dbsnp_vcfs.join(arc_vcfs.join(arc_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true).join(pantro_vcfs.join(pantro_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true)
+
+   output:
+   tuple path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stderr"), path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stdout") into addarc_logs
+   tuple val(chrom), path("${params.run_name}_wArchaics_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz"), path("${params.run_name}_wArchaics_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz.tbi") into addarc_vcfs
+
+   shell:
+   '''
+   module load !{params.mod_bcftools}
+   module load !{params.mod_htslib}
+   bcftools merge -m all -Oz -o !{params.run_name}_wArchaics_dbSNP!{params.dbsnp_build}_chr!{chrom}.vcf.gz !{invcf} !{arcvcf} !{pantrovcf} 2> !{params.run_name}_bcftools_merge_mall_archaics_PanTro_chr!{chrom}.stderr > !{params.run_name}_bcftools_merge_mall_archaics_PanTro_chr!{chrom}.stdout
+   tabix -f !{params.run_name}_wArchaics_dbSNP!{params.dbsnp_build}_chr!{chrom}.vcf.gz
+   '''
+}
+
+//Set up the channel to account for skipping adding the archaics:
+vcfs_to_validate = params.add_archaics ? addarc_vcfs : dbsnp_vcfs
 
 process validate_vcf {
    tag "${chrom}"
@@ -689,7 +580,7 @@ process validate_vcf {
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(chrom), path("${params.run_name}_wArchaics_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz"), path("${params.run_name}_wArchaics_dbSNP${params.dbsnp_build}_chr${chrom}.vcf.gz.tbi") from dbsnp_pass_vcf
+   tuple val(chrom), path(invcf), path(invcfidx) from vcfs_to_validate
    path ref
    path ref_dict
    path ref_fai
@@ -703,6 +594,6 @@ process validate_vcf {
    validate_retry_mem = params.vcf_check_mem.plus(task.attempt.minus(1).multiply(4))
    '''
    module load !{params.mod_gatk4}
-   gatk --java-options "-Xms!{validate_retry_mem}g -Xmx!{validate_retry_mem}g" ValidateVariants -V !{params.run_name}_wArchaics_dbSNP!{params.dbsnp_build}_chr!{chrom}.vcf.gz -R !{ref} -L !{chrom} --validation-type-to-exclude IDS --dbsnp !{known_dbsnp} 2> !{params.run_name}_final_chr!{chrom}_GATK_ValidateVariants.stderr > !{params.run_name}_final_chr!{chrom}_GATK_ValidateVariants.stdout
+   gatk --java-options "-Xms!{validate_retry_mem}g -Xmx!{validate_retry_mem}g" ValidateVariants -V !{invcf} -R !{ref} -L !{chrom} --validation-type-to-exclude IDS --dbsnp !{known_dbsnp} 2> !{params.run_name}_final_chr!{chrom}_GATK_ValidateVariants.stderr > !{params.run_name}_final_chr!{chrom}_GATK_ValidateVariants.stdout
    '''
 }

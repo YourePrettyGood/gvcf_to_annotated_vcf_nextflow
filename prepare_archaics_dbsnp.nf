@@ -141,15 +141,23 @@ process fix_arc_vcfs {
    '''
    module load !{params.mod_htslib}
    module load !{params.mod_bcftools}
-   bcftools view -h !{arcvcf} | \
+   #For some insane reason, the archaic VCFs are just plain gzipped, not bgzipped...:
+   bgzip -dc !{arcvcf} | bgzip -c > arcvcf_bgzipped.vcf.gz
+   tabix -f arcvcf_bgzipped.vcf.gz
+   #Extract and fix the header:
+   bcftools view -h arcvcf_bgzipped.vcf.gz | \
       !{projectDir}/fixArchaicVCFheader.awk -v "asm=!{params.asm_name}" !{ref_fai} - | \
       bgzip -c > fixed_header.vcf.gz
-   bcftools reheader -h fixed_header.vcf.gz -o !{namechrom}_fixedHeader.vcf.gz !{arcvcf}
+   #Reheader the bgzipped VCF:
+   bcftools reheader -h fixed_header.vcf.gz -o !{namechrom}_fixedHeader.vcf.gz arcvcf_bgzipped.vcf.gz
    tabix -f !{namechrom}_fixedHeader.vcf.gz
+   #Fix REF allele differences:
    bcftools norm -N -f !{ref} -c s -Oz -o !{namechrom}_fixed_notfiltered.vcf.gz !{namechrom}_fixedHeader.vcf.gz
    tabix -f !{namechrom}_fixed_notfiltered.vcf.gz
+   #Filter the VCF using the provided BED:
    bcftools view -R !{arcbed} -Oz -o !{namechrom}_fixed.vcf.gz !{namechrom}_fixed_notfiltered.vcf.gz
    tabix -f !{namechrom}_fixed.vcf.gz
+   rm arcvcf_bgzipped.vcf.gz arcvcf_bgzipped.vcf.gz.tbi
    rm fixed_header.vcf.gz
    rm !{namechrom}_fixedHeader.vcf.gz !{namechrom}_fixedHeader.vcf.gz.tbi
    rm !{namechrom}_fixed_notfiltered.vcf.gz !{namechrom}_fixed_notfiltered.vcf.gz.tbi
