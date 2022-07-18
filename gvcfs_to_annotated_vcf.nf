@@ -92,6 +92,7 @@ if (params.tierone_mem < 4) {
 //GATK CombineGVCFs tier two
 params.tiertwo_cpus = 1
 params.tiertwo_mem = 16
+params.tiertwo_memramp = 192
 params.tiertwo_timeout = '48h'
 if (params.tiertwo_mem < 4) {
    error "Running the second tier of combining gVCFs with less than 4 GB RAM probably won't work"
@@ -99,10 +100,12 @@ if (params.tiertwo_mem < 4) {
 //GATK GenotypeGVCFs
 params.jointgeno_cpus = 1
 params.jointgeno_mem = 64
+params.jointgeno_memramp = 184
 params.jointgeno_timeout = '24h'
 //VQSR
 params.vqsr_cpus = 1
 params.vqsr_mem = 8
+params.vqsr_memramp = 128
 params.vqsr_timeout = '24h'
 //Scatter VCF by chromosome
 params.scatter_cpus = 1
@@ -253,9 +256,10 @@ process combine_final {
    tag "${ref_chunk}"
 
    cpus params.tiertwo_cpus
-   memory { params.tiertwo_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.tiertwo_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   memory { params.tiertwo_mem.plus(1).plus(task.attempt.minus(1).multiply(params.tiertwo_memramp))+' GB' }
+   time { task.attempt == 2 ? '168h' : params.tiertwo_timeout }
+   queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
+   errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
@@ -273,7 +277,7 @@ process combine_final {
    tuple val(ref_chunk), path("${params.run_name}_tiertwo_region${ref_chunk}.g.vcf.gz.tbi") into tiertwo_gvcf_indices
 
    shell:
-   combine_retry_mem = params.tiertwo_mem.plus(task.attempt.minus(1).multiply(16))
+   combine_retry_mem = params.tiertwo_mem.plus(task.attempt.minus(1).multiply(params.tiertwo_memramp))
    ingvcf_list = ingvcfs
       .collect { ingvcf -> "-V ${ingvcf} " }
       .join()
@@ -287,9 +291,10 @@ process joint_genotype {
    tag "${ref_chunk}"
 
    cpus params.jointgeno_cpus
-   memory { params.jointgeno_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.jointgeno_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   memory { params.jointgeno_mem.plus(1).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' }
+   time { task.attempt == 2 ? '168h' : params.jointgeno_timeout }
+   queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
+   errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
@@ -306,7 +311,7 @@ process joint_genotype {
    path("${params.run_name}_region${ref_chunk}.vcf.gz.tbi") into genotyped_vcf_indices
 
    shell:
-   jointgeno_retry_mem = params.jointgeno_mem.plus(task.attempt.minus(1).multiply(16))
+   jointgeno_retry_mem = params.jointgeno_mem.plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))
    '''
    module load !{params.mod_gatk4}
    gatk --java-options "-Xmx!{jointgeno_retry_mem}g -Xms!{jointgeno_retry_mem}g" GenotypeGVCFs -R !{ref} -L !{regions} -O !{params.run_name}_region!{ref_chunk}.vcf.gz -V !{ingvcf} 2> !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stdout
@@ -319,8 +324,9 @@ process vqsr {
    //tag ""
 
    cpus params.vqsr_cpus
-   memory { params.vqsr_mem.plus(1).plus(task.attempt.minus(1).multiply(32))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.vqsr_timeout }
+   memory { params.vqsr_mem.plus(1).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' }
+   time { task.attempt == 2 ? '168h' : params.vqsr_timeout }
+   queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
@@ -356,7 +362,7 @@ process vqsr {
    tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz.tbi") into final_vqsr_vcf
 
    shell:
-   vqsr_retry_mem = params.vqsr_mem.plus(task.attempt.minus(1).multiply(32))
+   vqsr_retry_mem = params.vqsr_mem.plus(task.attempt.minus(1).multiply(params.vqsr_memramp))
    invcf_list = vcfs
       .collect { vcf -> "-V ${vcf} " }
       .join()
@@ -540,7 +546,7 @@ process add_archaic {
 
    cpus params.archaic_cpus
    memory { params.archaic_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.archaic_timeout }
+   time { task.attempt == 2 ? '168h' : params.archaic_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
