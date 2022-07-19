@@ -1,7 +1,7 @@
 #!/usr/bin/env nextflow
 /* Pipeline for joint genotyping of many gVCFs                              *
  * Core steps:                                                              *
- *  GATK CombineGVCFs (in batches) -> GATK CombineGVCFs (merge batches) ->  *
+ *  GATK GenomicsDBImport (in batches) ->                                   *
  *  GATK GenotypeGVCFs (scattered) -> GATK VariantRecalibrator (gathered) ->*
  *  GATK ApplyVQSR (then repeat these two steps again for indels) ->        * 
  *  bcftools +scatter (by major chromosome) -> bcftools annotate (dbSNP) -> *
@@ -61,11 +61,15 @@ dbsnp_idx = file(params.dbsnp+'.tbi', checkIfExists: true)
 //Default parameter values:
 //Regex for parsing the reference chunk ID out from the reference chunk BED filename:
 params.ref_chunk_regex = ~/^.+_region(\p{Digit}+)$/
+//Parameters for GenomicsDBImport:
+//GenomicsDBImport batch size, Broad recommends 50
+params.gvcfimport_batchsize = 50
+//GenomicsDBImport interval padding, Broad prod WGS germline pipeline had 500
+//I'm worried that it will create duplication in the DB, so using 0
+params.gvcfimport_padding = 0
 //Regex for parsing the reference chunk ID out from the joint genotyped VCF filename:
 //vcf_region_regex = ~/^.+_region(\p{Digit}+)$/
 //   path("${params.run_name}_region${ref_chunk}.vcf.gz") into genotyped_vcfs
-//Regex for parsing the batch ID out from the gVCF filename:
-//gvcf_batch_regex = ~/^.+_batch(\p{Digit}+)_region\p{Digit}+$/
 //Number of distributions to use in the mixture models for VQSR:
 //Number of multivariate Normal distributions to use in the "positive" mixture
 // model for SNP VQSR:
@@ -82,20 +86,13 @@ params.indel_mvn_k = 4
 params.index_cpus = 1
 params.index_mem = 1
 params.index_timeout = '1h'
-//GATK CombineGVCFs tier one
-params.tierone_cpus = 1
-params.tierone_mem = 16
-params.tierone_timeout = '48h'
-if (params.tierone_mem < 4) {
-   error "Running the first tier of combining gVCFs with less than 4 GB RAM probably won't work"
-}
-//GATK CombineGVCFs tier two
-params.tiertwo_cpus = 1
-params.tiertwo_mem = 16
-params.tiertwo_memramp = 192
-params.tiertwo_timeout = '48h'
-if (params.tiertwo_mem < 4) {
-   error "Running the second tier of combining gVCFs with less than 4 GB RAM probably won't work"
+//GATK GenomicsDBImport
+params.gvcfimport_cpus = 5
+params.gvcfimport_mem = 8
+params.gvcfimport_memramp = 32
+params.gvcfimport_timeout = '72h'
+if (params.gvcfimport_mem < 4) {
+   error "Importing gVCFs with less than 4 GB RAM probably won't work"
 }
 //GATK GenotypeGVCFs
 params.jointgeno_cpus = 1
@@ -204,86 +201,51 @@ process index_gvcfs {
 
    output:
    tuple path("GATK_IndexFeatureFile_sample${sample_id}.stderr"), path("GATK_IndexFeatureFile_sample${sample_id}.stdout") into index_logs
-   tuple val(batch_id), path("${sample}.g.vcf.gz") into gvcfs_tobatch
-   tuple val(batch_id), path("${sample}.g.vcf.gz.tbi") into gvcf_indices_tobatch
+   path("${sample}.g.vcf.gz") into gvcfs_toimport
+   path("${sample}.g.vcf.gz.tbi") into tbis_toimport
 
    shell:
-   batch_id = sample_id.minus(1).intdiv(params.batch_size)
    '''
    module load !{params.mod_gatk4}
    gatk IndexFeatureFile -I !{sample}.g.vcf.gz 2> GATK_IndexFeatureFile_sample!{sample_id}.stderr > GATK_IndexFeatureFile_sample!{sample_id}.stdout
    '''
 }
 
-process combine_tierone {
-   tag "${batch_id}_${ref_chunk}"
-
-   cpus params.tierone_cpus
-   memory { params.tierone_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.tierone_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
-   maxRetries 1
-
-   publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
-
-   input:
-   tuple val(batch_id), path(ingvcfs) from gvcfs_tobatch.groupTuple(by: 0, size: params.batch_size, remainder: true, sort: true)
-   tuple val(idx_batch_id), path(ingvcfidx) from gvcf_indices_tobatch.groupTuple(by: 0, size: params.batch_size, remainder: true, sort: true)
-   path ref
-   path ref_dict
-   path ref_fai
-   each path(regions) from scattered_regions
-
-   output:
-   tuple path("${params.run_name}_GATK_CombineGVCFs_tierone_batch${batch_id}_region${ref_chunk}.stderr"), path("${params.run_name}_GATK_CombineGVCFs_tierone_batch${batch_id}_region${ref_chunk}.stdout") into tierone_logs
-   tuple val(ref_chunk_int), path("${params.run_name}_tierone_batch${batch_id}_region${ref_chunk}.g.vcf.gz") into tierone_gvcfs
-   tuple val(ref_chunk_int), path("${params.run_name}_tierone_batch${batch_id}_region${ref_chunk}.g.vcf.gz.tbi") into tierone_gvcf_indices
-
-   shell:
-   combine_retry_mem = params.tierone_mem.plus(task.attempt.minus(1).multiply(16))
-   ref_chunk = (regions.getSimpleName() =~ params.ref_chunk_regex)[0][1]
-   ref_chunk_int = ref_chunk.toInteger()
-   ingvcf_list = ingvcfs
-      .collect { ingvcf -> "-V ${ingvcf} " }
-      .join()
-   '''
-   module load !{params.mod_gatk4}
-   gatk --java-options "-Xmx!{combine_retry_mem}g -Xms!{combine_retry_mem}g" CombineGVCFs -R !{ref} -L !{regions} -O !{params.run_name}_tierone_batch!{batch_id}_region!{ref_chunk}.g.vcf.gz !{ingvcf_list} 2> !{params.run_name}_GATK_CombineGVCFs_tierone_batch!{batch_id}_region!{ref_chunk}.stderr > !{params.run_name}_GATK_CombineGVCFs_tierone_batch!{batch_id}_region!{ref_chunk}.stdout
-   '''
-}
-
-process combine_final {
+process gvcf_import {
    tag "${ref_chunk}"
 
-   cpus params.tiertwo_cpus
-   memory { params.tiertwo_mem.plus(1).plus(task.attempt.minus(1).multiply(params.tiertwo_memramp))+' GB' }
-   time { task.attempt == 2 ? '168h' : params.tiertwo_timeout }
-   queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
+   cpus params.gvcfimport_cpus
+   memory { params.gvcfimport_mem.plus(4).plus(task.attempt.minus(1).multiply(params.gvcfimport_memramp))+' GB' }
+   time { task.attempt == 2 ? '168h' : params.gvcfimport_timeout }
    errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(ref_chunk), path(ingvcfs), path(regions) from tierone_gvcfs.groupTuple(by: 0, sort: {a,b -> (a.getSimpleName() =~ ~/^.+_batch(\p{Digit}+)_region\p{Digit}+$/)[0][1].toInteger() <=> (b.getSimpleName() =~ ~/^.+_batch(\p{Digit}+)_region\p{Digit}+$/)[0][1].toInteger()}).ifEmpty( { error "groupTuple on tierone_gvcfs is empty" } ).combine(scattered_regions_tojoin, by: 0).ifEmpty( { error "combine of tierone batch gvcfs by ref region with region files was empty" } )
-   tuple val(idx_ref_chunk), path(ingvcfidx) from tierone_gvcf_indices.groupTuple(by: 0)
+   path("*") from gvcfs_toimport.collect()
+   path("*") from tbis_toimport.collect()
    path ref
    path ref_dict
    path ref_fai
+   each path(regions) from scattered_regions
 
    output:
-   tuple path("${params.run_name}_GATK_CombineGVCFs_tiertwo_region${ref_chunk}.stderr"), path("${params.run_name}_GATK_CombineGVCFs_tiertwo_region${ref_chunk}.stdout") into tiertwo_logs
-   tuple val(ref_chunk), path("${params.run_name}_tiertwo_region${ref_chunk}.g.vcf.gz"), path("${regions}") into tiertwo_gvcfs
-   tuple val(ref_chunk), path("${params.run_name}_tiertwo_region${ref_chunk}.g.vcf.gz.tbi") into tiertwo_gvcf_indices
+   tuple path("${params.run_name}_GATK_GenomicsDBImport_region${ref_chunk}.stderr"), path("${params.run_name}_GATK_GenomicsDBImport_region${ref_chunk}.stdout") into gvcfimport_logs
+   tuple val(ref_chunk_int), path("${params.run_name}_GenomicsDB_region${ref_chunk}.tar.gz") into gvcfimport_genomicsdbs
 
    shell:
-   combine_retry_mem = params.tiertwo_mem.plus(task.attempt.minus(1).multiply(params.tiertwo_memramp))
-   ingvcf_list = ingvcfs
-      .collect { ingvcf -> "-V ${ingvcf} " }
-      .join()
+   import_retry_mem = params.gvcfimport_mem.plus(task.attempt.minus(1).multiply(params.gvcfimport_memramp))
+   ref_chunk = (regions.getSimpleName() =~ params.ref_chunk_regex)[0][1]
+   ref_chunk_int = ref_chunk.toInteger()
    '''
    module load !{params.mod_gatk4}
-   gatk --java-options "-Xmx!{combine_retry_mem}g -Xms!{combine_retry_mem}g" CombineGVCFs -R !{ref} -L !{regions} -O !{params.run_name}_tiertwo_region!{ref_chunk}.g.vcf.gz !{ingvcf_list} 2> !{params.run_name}_GATK_CombineGVCFs_tiertwo_region!{ref_chunk}.stderr > !{params.run_name}_GATK_CombineGVCFs_tiertwo_region!{ref_chunk}.stdout
+   mkdir genomicsdb_tmp
+   ls *.g.vcf.gz | \
+      awk 'BEGIN{OFS="\t";}{n=split($1, a, "/"); m=split(a[n], b, "[.]"); print b[1], $1;}' | \
+      sort -k1,1V > sampleID_gVCF_map.tsv
+   gatk --java-options "-Xmx!{import_retry_mem}g -Xms!{import_retry_mem}g" GenomicsDBImport --genomicsdb-workspace-path !{params.run_name}_GenomicsDB_region!{ref_chunk}_workspace --batch-size !{params.gvcfimport_batchsize} -L !{regions} --sample-name-map sampleID_gVCF_map.tsv --reader-threads !{task.cpus} -ip !{params.gvcfimport_padding} --tmp-dir !{workDir}/genomicsdb_tmp --validate-sample-name-map 2> !{params.run_name}_GATK_GenomicsDBImport_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenomicsDBImport_region!{ref_chunk}.stdout
+   tar -czf !{params.run_name}_GenomicsDB_region!{ref_chunk}.tar.gz !{params.run_name}_GenomicsDB_region!{ref_chunk}_workspace
    '''
 }
 
@@ -300,8 +262,7 @@ process joint_genotype {
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(ref_chunk), path(ingvcf), path(regions) from tiertwo_gvcfs
-   tuple val(idx_ref_chunk), path(ingvcfidx) from tiertwo_gvcf_indices
+   tuple val(ref_chunk), path(genomicsdbtargz) from gvcfimport_genomicsdbs
    path ref
    path ref_dict
    path ref_fai
@@ -314,10 +275,12 @@ process joint_genotype {
    jointgeno_retry_mem = params.jointgeno_mem.plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))
    '''
    module load !{params.mod_gatk4}
-   gatk --java-options "-Xmx!{jointgeno_retry_mem}g -Xms!{jointgeno_retry_mem}g" GenotypeGVCFs -R !{ref} -L !{regions} -O !{params.run_name}_region!{ref_chunk}.vcf.gz -V !{ingvcf} 2> !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stdout
+   mkdir genomicsdb_tmp
+   tar -xzf !{genomicsdbtargz}
+   genomicsdb=$(basename !{genomicsdbtargz} .tar.gz)
+   gatk --java-options "-Xmx!{jointgeno_retry_mem}g -Xms!{jointgeno_retry_mem}g" GenotypeGVCFs -R !{ref} -L !{regions} -O !{params.run_name}_region!{ref_chunk}.vcf.gz -V gendb://${genomicsdb} --tmp-dir !{workDir}/genomicsdb_tmp --only-output-calls-starting-in-intervals 2> !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stdout
    '''
 }
-//
 
 //VQSR
 process vqsr {
