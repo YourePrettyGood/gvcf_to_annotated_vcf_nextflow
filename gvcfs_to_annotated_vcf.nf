@@ -260,10 +260,10 @@ process joint_genotype {
    tag "${ref_chunk}"
 
    cpus params.jointgeno_cpus
-   memory { task.exitStatus in [1,135,137] ? params.jointgeno_mem.plus(5).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' : params.jointgeno_mem.plus(5)+' GB' }
+   memory { task.exitStatus in [1,135,137,247] ? params.jointgeno_mem.plus(5).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' : params.jointgeno_mem.plus(5)+' GB' }
    time { task.attempt == 2 ? '672h' : params.jointgeno_timeout }
-   queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
-   errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
+   queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
+   errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
@@ -295,10 +295,10 @@ process vqsr {
    //tag ""
 
    cpus params.vqsr_cpus
-   memory { task.exitStatus in [1,135,137] ? params.vqsr_mem.plus(5).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' : params.vqsr_mem.plus(5)+' GB' }
+   memory { task.exitStatus in [1,135,137,247] ? params.vqsr_mem.plus(5).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' : params.vqsr_mem.plus(5)+' GB' }
    time { task.attempt == 2 ? '672h' : params.vqsr_timeout }
-   queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
-   errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
+   queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
+   errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
