@@ -87,35 +87,35 @@ params.index_cpus = 1
 params.index_mem = 1
 params.index_timeout = '1h'
 //GATK GenomicsDBImport
-params.gvcfimport_cpus = 5
-params.gvcfimport_mem = 8
+params.gvcfimport_cpus = 1
+params.gvcfimport_mem = 16
 params.gvcfimport_memramp = 32
-params.gvcfimport_timeout = '72h'
+params.gvcfimport_timeout = '168h'
 if (params.gvcfimport_mem < 4) {
    error "Importing gVCFs with less than 4 GB RAM probably won't work"
 }
 //GATK GenotypeGVCFs
 params.jointgeno_cpus = 1
-params.jointgeno_mem = 64
+params.jointgeno_mem = 32
 params.jointgeno_memramp = 184
-params.jointgeno_timeout = '24h'
+params.jointgeno_timeout = '168h'
 //VQSR
 params.vqsr_cpus = 1
 params.vqsr_mem = 8
 params.vqsr_memramp = 128
-params.vqsr_timeout = '24h'
+params.vqsr_timeout = '72h'
 //Scatter VCF by chromosome
 params.scatter_cpus = 1
 params.scatter_mem = 16
-params.scatter_timeout = '24h'
+params.scatter_timeout = '48h'
 //Merge VCFs with archaics and PanTro from EPO
 params.archaic_cpus = 20
 params.archaic_mem = 32
-params.archaic_timeout = '24h'
+params.archaic_timeout = '48h'
 //Annotate VCF with dbSNP
 params.dbsnp_cpus = 1
 params.dbsnp_mem = 16
-params.dbsnp_timeout = '24h'
+params.dbsnp_timeout = '48h'
 //GATK ValidateVariants
 params.vcf_check_cpus = 1
 params.vcf_check_mem = 1
@@ -216,15 +216,15 @@ process gvcf_import {
 
    cpus params.gvcfimport_cpus
    memory { params.gvcfimport_mem.plus(4).plus(task.attempt.minus(1).multiply(params.gvcfimport_memramp))+' GB' }
-   time { task.attempt == 2 ? '168h' : params.gvcfimport_timeout }
+   time { task.attempt == 2 ? '672h' : params.gvcfimport_timeout }
    errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   path("*") from gvcfs_toimport.collect()
-   path("*") from tbis_toimport.collect()
+   path("gvcf_paths.tsv") from gvcfs_toimport.collectFile() { [ "gvcf_paths.tsv", it.getSimpleName()+'\t'+it.getName()+'\t'+it+'\n' ] }
+   path("tbi_paths.tsv") from tbis_toimport.collectFile() { [ "tbi_paths.tsv", it.getName()+'\t'+it+'\n' ] }
    path ref
    path ref_dict
    path ref_fai
@@ -232,7 +232,7 @@ process gvcf_import {
 
    output:
    tuple path("${params.run_name}_GATK_GenomicsDBImport_region${ref_chunk}.stderr"), path("${params.run_name}_GATK_GenomicsDBImport_region${ref_chunk}.stdout") into gvcfimport_logs
-   tuple val(ref_chunk_int), path("${params.run_name}_GenomicsDB_region${ref_chunk}.tar.gz") into gvcfimport_genomicsdbs
+   tuple val(ref_chunk), path("${params.run_name}_GenomicsDB_region${ref_chunk}.tar.gz"), path(regions) into gvcfimport_genomicsdbs
 
    shell:
    import_retry_mem = params.gvcfimport_mem.plus(task.attempt.minus(1).multiply(params.gvcfimport_memramp))
@@ -241,10 +241,17 @@ process gvcf_import {
    '''
    module load !{params.mod_gatk4}
    mkdir genomicsdb_tmp
-   ls *.g.vcf.gz | \
-      awk 'BEGIN{OFS="\t";}{n=split($1, a, "/"); m=split(a[n], b, "[.]"); print b[1], $1;}' | \
+   while read -a a;
+      do
+      ln -s ${a[1]} ${a[0]};
+   done < tbi_paths.tsv
+   while read -a a;
+      do
+      ln -s ${a[2]} ${a[1]};
+      printf "${a[0]}\t${a[1]}\n";
+   done < gvcf_paths.tsv | \
       sort -k1,1V > sampleID_gVCF_map.tsv
-   gatk --java-options "-Xmx!{import_retry_mem}g -Xms!{import_retry_mem}g" GenomicsDBImport --genomicsdb-workspace-path !{params.run_name}_GenomicsDB_region!{ref_chunk}_workspace --batch-size !{params.gvcfimport_batchsize} -L !{regions} --sample-name-map sampleID_gVCF_map.tsv --reader-threads !{task.cpus} -ip !{params.gvcfimport_padding} --tmp-dir !{workDir}/genomicsdb_tmp --validate-sample-name-map 2> !{params.run_name}_GATK_GenomicsDBImport_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenomicsDBImport_region!{ref_chunk}.stdout
+   gatk --java-options "-Xmx!{import_retry_mem}g -Xms!{import_retry_mem}g" GenomicsDBImport --genomicsdb-workspace-path !{params.run_name}_GenomicsDB_region!{ref_chunk}_workspace --batch-size !{params.gvcfimport_batchsize} -L !{regions} --sample-name-map sampleID_gVCF_map.tsv --reader-threads !{task.cpus} -ip !{params.gvcfimport_padding} --tmp-dir genomicsdb_tmp --validate-sample-name-map --genomicsdb-shared-posixfs-optimizations 2> !{params.run_name}_GATK_GenomicsDBImport_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenomicsDBImport_region!{ref_chunk}.stdout
    tar -czf !{params.run_name}_GenomicsDB_region!{ref_chunk}.tar.gz !{params.run_name}_GenomicsDB_region!{ref_chunk}_workspace
    '''
 }
@@ -253,8 +260,8 @@ process joint_genotype {
    tag "${ref_chunk}"
 
    cpus params.jointgeno_cpus
-   memory { params.jointgeno_mem.plus(1).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' }
-   time { task.attempt == 2 ? '168h' : params.jointgeno_timeout }
+   memory { task.exitStatus in [1,135,137] ? params.jointgeno_mem.plus(5).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' : params.jointgeno_mem.plus(5)+' GB' }
+   time { task.attempt == 2 ? '672h' : params.jointgeno_timeout }
    queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
@@ -262,7 +269,7 @@ process joint_genotype {
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(ref_chunk), path(genomicsdbtargz) from gvcfimport_genomicsdbs
+   tuple val(ref_chunk), path(genomicsdbtargz), path(regions) from gvcfimport_genomicsdbs
    path ref
    path ref_dict
    path ref_fai
@@ -272,13 +279,14 @@ process joint_genotype {
    path("${params.run_name}_region${ref_chunk}.vcf.gz.tbi") into genotyped_vcf_indices
 
    shell:
-   jointgeno_retry_mem = params.jointgeno_mem.plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))
+   jointgeno_retry_mem = task.memory.toGiga().minus(5)
+//   jointgeno_retry_mem = params.jointgeno_mem.plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))
    '''
    module load !{params.mod_gatk4}
    mkdir genomicsdb_tmp
    tar -xzf !{genomicsdbtargz}
    genomicsdb=$(basename !{genomicsdbtargz} .tar.gz)
-   gatk --java-options "-Xmx!{jointgeno_retry_mem}g -Xms!{jointgeno_retry_mem}g" GenotypeGVCFs -R !{ref} -L !{regions} -O !{params.run_name}_region!{ref_chunk}.vcf.gz -V gendb://${genomicsdb} --tmp-dir !{workDir}/genomicsdb_tmp --only-output-calls-starting-in-intervals 2> !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stdout
+   gatk --java-options "-Xmx!{jointgeno_retry_mem}g -Xms!{jointgeno_retry_mem}g" GenotypeGVCFs -R !{ref} -L !{regions} -O !{params.run_name}_region!{ref_chunk}.vcf.gz -V gendb://${genomicsdb}_workspace --tmp-dir genomicsdb_tmp --only-output-calls-starting-in-intervals --genomicsdb-shared-posixfs-optimizations 2> !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stderr > !{params.run_name}_GATK_GenotypeGVCFs_region!{ref_chunk}.stdout
    '''
 }
 
@@ -287,8 +295,8 @@ process vqsr {
    //tag ""
 
    cpus params.vqsr_cpus
-   memory { params.vqsr_mem.plus(1).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' }
-   time { task.attempt == 2 ? '168h' : params.vqsr_timeout }
+   memory { task.exitStatus in [1,135,137] ? params.vqsr_mem.plus(5).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' : params.vqsr_mem.plus(5)+' GB' }
+   time { task.attempt == 2 ? '672h' : params.vqsr_timeout }
    queue { task.exitStatus in [1,135,137] ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
@@ -325,7 +333,8 @@ process vqsr {
    tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz.tbi") into final_vqsr_vcf
 
    shell:
-   vqsr_retry_mem = params.vqsr_mem.plus(task.attempt.minus(1).multiply(params.vqsr_memramp))
+   vqsr_retry_mem = task.memory.toGiga().minus(5)
+//   vqsr_retry_mem = params.vqsr_mem.plus(task.attempt.minus(1).multiply(params.vqsr_memramp))
    invcf_list = vcfs
       .collect { vcf -> "-V ${vcf} " }
       .join()
@@ -441,7 +450,7 @@ process perchrom_vcfs {
 
    cpus params.scatter_cpus
    memory { params.scatter_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '48h' : params.scatter_timeout }
+   time { task.attempt == 2 ? '120h' : params.scatter_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
@@ -476,7 +485,7 @@ process annotate_dbsnp {
 
    cpus params.dbsnp_cpus
    memory { params.dbsnp_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
-   time { task.attempt == 2 ? '72h' : params.dbsnp_timeout }
+   time { task.attempt == 2 ? '120h' : params.dbsnp_timeout }
    errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
    maxRetries 1
 
@@ -519,7 +528,7 @@ process add_archaic {
    when: params.add_archaics
 
    input:
-   tuple val(chrom), path(invcf), path(invcfidx), path(arcvcf), path(arcvcfidx), path(pantrovcf), path(pantrovcfidx) from dbsnp_vcfs.join(arc_vcfs.join(arc_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true).join(pantro_vcfs.join(pantro_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true)
+   tuple val(chrom), path(invcf), path(invcfidx), path(arcvcf), path(arcvcfidx), path(pantrovcf), path(pantrovcfidx) from dbsnp_vcfs.filter({ params.chrom_list.tokenize(',').minus('Y').minus('MT').contains(it[0]) }).join(arc_vcfs.join(arc_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true).join(pantro_vcfs.join(pantro_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true)
 
    output:
    tuple path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stderr"), path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stdout") into addarc_logs
