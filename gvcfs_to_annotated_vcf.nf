@@ -26,14 +26,30 @@ params.tgp_snps = "${params.ref_prefix}/Broad/b37/1000G_phase1.snps.high_confide
 params.dbsnp_vqsr = "${params.ref_prefix}/Broad/b37/dbsnp_138.b37.vcf"
 params.mills_indels = "${params.ref_prefix}/Broad/b37/Mills_and_1000G_gold_standard.indels.b37.vcf"
 
-//Set up the channels of gVCFs:
-sample_id = 0
-Channel
-   .fromPath(params.gvcf_glob, checkIfExists: true)
-   .ifEmpty { error "Unable to find gVCFs matching glob: ${params.gvcf_glob}" }
-   .map { gvcf -> sample_id += 1; return [sample_id, gvcf.getSimpleName(), gvcf] }
-   .tap { gvcfs }
-   .subscribe { println "Added ${it[1]} (${it[2]}) to gvcfs channel" }
+//If starting the pipeline with .tar.gz files of GenomicsDB workspaces,
+// create a channel of them and skip indexing and GenomicsDBImport:
+//Default is to set this to false so that we do indexing and GenomicsDBImport
+params.already_imported = false
+
+if (params.already_imported) {
+   Channel
+      .fromPath(params.genomicsdb_glob, checkIfExists: true)
+      .ifEmpty { error "Unable to find GenomicsDB tarballs matching glob: ${params.genomicsdb_glob}" }
+      .map { [ (it.getSimpleName() =~ ~/_region([0-9]+)$/)[0][1].toInteger(), it] }
+      .tap { genomicsdb_targzs }
+      .subscribe { println "Added ${it[1]} to genomicsdb_targzs channel" }
+   gvcfs = Channel.empty()
+} else {
+   //Set up the channels of gVCFs:
+   sample_id = 0
+   Channel
+      .fromPath(params.gvcf_glob, checkIfExists: true)
+      .ifEmpty { error "Unable to find gVCFs matching glob: ${params.gvcf_glob}" }
+      .map { gvcf -> sample_id += 1; return [sample_id, gvcf.getSimpleName(), gvcf] }
+      .tap { gvcfs }
+      .subscribe { println "Added ${it[1]} (${it[2]}) to gvcfs channel" }
+   genomicsdb_targzs = Channel.empty()
+}
 
 //Set up the file channels for the ref and its various index components:
 //Inspired by the IARC alignment-nf pipeline
@@ -90,6 +106,7 @@ params.index_timeout = '1h'
 params.gvcfimport_cpus = 1
 params.gvcfimport_mem = 16
 params.gvcfimport_memramp = 32
+params.gvcfimport_memoverhead = 4
 params.gvcfimport_timeout = '168h'
 if (params.gvcfimport_mem < 4) {
    error "Importing gVCFs with less than 4 GB RAM probably won't work"
@@ -98,24 +115,26 @@ if (params.gvcfimport_mem < 4) {
 params.jointgeno_cpus = 1
 params.jointgeno_mem = 32
 params.jointgeno_memramp = 184
+params.jointgeno_memoverhead = 5
 params.jointgeno_timeout = '168h'
 //VQSR
 params.vqsr_cpus = 1
 params.vqsr_mem = 8
 params.vqsr_memramp = 128
+params.vqsr_memoverhead = 5
 params.vqsr_timeout = '72h'
 //Scatter VCF by chromosome
 params.scatter_cpus = 1
 params.scatter_mem = 16
 params.scatter_timeout = '48h'
-//Merge VCFs with archaics and PanTro from EPO
-params.archaic_cpus = 20
-params.archaic_mem = 32
-params.archaic_timeout = '48h'
 //Annotate VCF with dbSNP
 params.dbsnp_cpus = 1
 params.dbsnp_mem = 16
 params.dbsnp_timeout = '48h'
+//Merge VCFs with archaics and PanTro from EPO
+params.archaic_cpus = 20
+params.archaic_mem = 32
+params.archaic_timeout = '48h'
 //GATK ValidateVariants
 params.vcf_check_cpus = 1
 params.vcf_check_mem = 1
@@ -196,6 +215,8 @@ process index_gvcfs {
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
+   when: !params.already_imported
+
    input:
    tuple val(sample_id), val(sample), path("${sample}.g.vcf.gz") from gvcfs
 
@@ -215,12 +236,15 @@ process gvcf_import {
    tag "${ref_chunk}"
 
    cpus params.gvcfimport_cpus
-   memory { params.gvcfimport_mem.plus(4).plus(task.attempt.minus(1).multiply(params.gvcfimport_memramp))+' GB' }
+   memory { params.gvcfimport_mem.plus(params.gvcfimport_memoverhead).plus(task.attempt.minus(1).multiply(params.gvcfimport_memramp))+' GB' }
    time { task.attempt == 2 ? '672h' : params.gvcfimport_timeout }
-   errorStrategy { task.exitStatus in ([1]+(134..140).collect()) ? 'retry' : 'terminate' }
+   errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
+   publishDir path: "${params.output_dir}/GenomicsDB", mode: 'rellink', pattern: '*.tar.gz', enabled: !params.already_imported
+
+   when: !params.already_imported
 
    input:
    path("gvcf_paths.tsv") from gvcfs_toimport.collectFile() { [ "gvcf_paths.tsv", it.getSimpleName()+'\t'+it.getName()+'\t'+it+'\n' ] }
@@ -256,11 +280,18 @@ process gvcf_import {
    '''
 }
 
+//Set up the channel to account for starting straight from GenomicsDBs:
+if (params.already_imported) {
+   input_genomicsdbs = genomicsdb_targzs
+      .join(scattered_regions_tojoin, by: 0, failOnDuplicate: true, failOnMismatch: true)
+}
+genomicsdbs = params.already_imported ? input_genomicsdbs : gvcfimport_genomicsdbs
+
 process joint_genotype {
    tag "${ref_chunk}"
 
    cpus params.jointgeno_cpus
-   memory { task.exitStatus in [1,135,137,247] ? params.jointgeno_mem.plus(5).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' : params.jointgeno_mem.plus(5)+' GB' }
+   memory { task.exitStatus in [1,135,137,247] ? params.jointgeno_mem.plus(params.jointgeno_memoverhead).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' : params.jointgeno_mem.plus(params.jointgeno_memoverhead)+' GB' }
    time { task.attempt == 2 ? '672h' : params.jointgeno_timeout }
    queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
@@ -269,7 +300,7 @@ process joint_genotype {
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
 
    input:
-   tuple val(ref_chunk), path(genomicsdbtargz), path(regions) from gvcfimport_genomicsdbs
+   tuple val(ref_chunk), path(genomicsdbtargz), path(regions) from genomicsdbs
    path ref
    path ref_dict
    path ref_fai
@@ -279,8 +310,7 @@ process joint_genotype {
    path("${params.run_name}_region${ref_chunk}.vcf.gz.tbi") into genotyped_vcf_indices
 
    shell:
-   jointgeno_retry_mem = task.memory.toGiga().minus(5)
-//   jointgeno_retry_mem = params.jointgeno_mem.plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))
+   jointgeno_retry_mem = task.memory.toGiga().minus(params.jointgeno_memoverhead)
    '''
    module load !{params.mod_gatk4}
    mkdir genomicsdb_tmp
@@ -295,7 +325,7 @@ process vqsr {
    //tag ""
 
    cpus params.vqsr_cpus
-   memory { task.exitStatus in [1,135,137,247] ? params.vqsr_mem.plus(5).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' : params.vqsr_mem.plus(5)+' GB' }
+   memory { task.exitStatus in [1,135,137,247] ? params.vqsr_mem.plus(params.vqsr_memoverhead).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' : params.vqsr_mem.plus(params.vqsr_memoverhead)+' GB' }
    time { task.attempt == 2 ? '672h' : params.vqsr_timeout }
    queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
@@ -333,8 +363,7 @@ process vqsr {
    tuple path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz"), path("${params.run_name}_SNPVQSR_${params.snp_sens}_INDELVQSR_${params.indel_sens}.vcf.gz.tbi") into final_vqsr_vcf
 
    shell:
-   vqsr_retry_mem = task.memory.toGiga().minus(5)
-//   vqsr_retry_mem = params.vqsr_mem.plus(task.attempt.minus(1).multiply(params.vqsr_memramp))
+   vqsr_retry_mem = task.memory.toGiga().minus(params.vqsr_memoverhead)
    invcf_list = vcfs
       .collect { vcf -> "-V ${vcf} " }
       .join()
@@ -449,9 +478,9 @@ process perchrom_vcfs {
    //tag ""
 
    cpus params.scatter_cpus
-   memory { params.scatter_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
+   memory { params.scatter_mem.plus(task.attempt.minus(1).multiply(16))+' GB' }
    time { task.attempt == 2 ? '120h' : params.scatter_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   errorStrategy { task.exitStatus in ([247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
@@ -484,9 +513,9 @@ process annotate_dbsnp {
    tag "${chrom}"
 
    cpus params.dbsnp_cpus
-   memory { params.dbsnp_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
+   memory { params.dbsnp_mem.plus(task.attempt.minus(1).multiply(16))+' GB' }
    time { task.attempt == 2 ? '120h' : params.dbsnp_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   errorStrategy { task.exitStatus in ([247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
@@ -517,9 +546,9 @@ process add_archaic {
    tag "${chrom}"
 
    cpus params.archaic_cpus
-   memory { params.archaic_mem.plus(1).plus(task.attempt.minus(1).multiply(16))+' GB' }
+   memory { params.archaic_mem.plus(task.attempt.minus(1).multiply(16))+' GB' }
    time { task.attempt == 2 ? '168h' : params.archaic_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   errorStrategy { task.exitStatus in ([247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
@@ -552,7 +581,7 @@ process validate_vcf {
    cpus params.vcf_check_cpus
    memory { params.vcf_check_mem.plus(1).plus(task.attempt.minus(1).multiply(4))+' GB' }
    time { task.attempt == 2 ? '48h' : params.vcf_check_timeout }
-   errorStrategy { task.exitStatus in 134..140 ? 'retry' : 'terminate' }
+   errorStrategy { task.exitStatus in ([247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
    publishDir path: "${params.output_dir}/logs", mode: 'copy', pattern: '*.std{err,out}'
