@@ -292,7 +292,7 @@ process joint_genotype {
 
    cpus params.jointgeno_cpus
    memory { task.exitStatus in [1,135,137,247] ? params.jointgeno_mem.plus(params.jointgeno_memoverhead).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' : params.jointgeno_mem.plus(params.jointgeno_memoverhead)+' GB' }
-   time { task.attempt == 2 ? '672h' : params.jointgeno_timeout }
+   time { task.exitStatus in [140] ? '672h' : params.jointgeno_timeout }
    queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
@@ -326,7 +326,7 @@ process vqsr {
 
    cpus params.vqsr_cpus
    memory { task.exitStatus in [1,135,137,247] ? params.vqsr_mem.plus(params.vqsr_memoverhead).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' : params.vqsr_mem.plus(params.vqsr_memoverhead)+' GB' }
-   time { task.attempt == 2 ? '672h' : params.vqsr_timeout }
+   time { task.exitStatus in [140] ? '672h' : params.vqsr_timeout }
    queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
