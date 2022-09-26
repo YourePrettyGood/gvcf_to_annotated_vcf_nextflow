@@ -237,7 +237,8 @@ process gvcf_import {
 
    cpus params.gvcfimport_cpus
    memory { params.gvcfimport_mem.plus(params.gvcfimport_memoverhead).plus(task.attempt.minus(1).multiply(params.gvcfimport_memramp))+' GB' }
-   time { task.attempt == 2 ? '672h' : params.gvcfimport_timeout }
+   time { task.exitStatus in [140] ? params.base_maxtimeout : task.exitStatus in [1,135,137,247] && params.gvcfimport_switchqueue ? params.bigmem_maxtimeout : params.gvcfimport_timeout }
+   queue { task.exitStatus in [1,135,137,247] && params.gvcfimport_switchqueue ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
@@ -292,8 +293,8 @@ process joint_genotype {
 
    cpus params.jointgeno_cpus
    memory { task.exitStatus in [1,135,137,247] ? params.jointgeno_mem.plus(params.jointgeno_memoverhead).plus(task.attempt.minus(1).multiply(params.jointgeno_memramp))+' GB' : params.jointgeno_mem.plus(params.jointgeno_memoverhead)+' GB' }
-   time { task.exitStatus in [140] ? '672h' : params.jointgeno_timeout }
-   queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
+   time { task.exitStatus in [140] ? params.base_maxtimeout : task.exitStatus in [1,135,137,247] && params.jointgeno_switchqueue ? params.bigmem_maxtimeout : params.jointgeno_timeout }
+   queue { task.exitStatus in [1,135,137,247] && params.jointgeno_switchqueue ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
@@ -326,8 +327,8 @@ process vqsr {
 
    cpus params.vqsr_cpus
    memory { task.exitStatus in [1,135,137,247] ? params.vqsr_mem.plus(params.vqsr_memoverhead).plus(task.attempt.minus(1).multiply(params.vqsr_memramp))+' GB' : params.vqsr_mem.plus(params.vqsr_memoverhead)+' GB' }
-   time { task.exitStatus in [140] ? '672h' : params.vqsr_timeout }
-   queue { task.exitStatus in [1,135,137,247] ? params.bigmem_queue : params.base_queue }
+   time { task.exitStatus in [140] ? params.base_maxtimeout : task.exitStatus in [1,135,137,247] && params.vqsr_switchqueue ? params.bigmem_maxtimeout : params.vqsr_timeout }
+   queue { task.exitStatus in [1,135,137,247] && params.vqsr_switchqueue ? params.bigmem_queue : params.base_queue }
    errorStrategy { task.exitStatus in ([1,247]+(134..140).collect()) ? 'retry' : 'terminate' }
    maxRetries 1
 
@@ -522,7 +523,7 @@ process annotate_dbsnp {
    publishDir path: "${params.output_dir}/final_VCFs", mode: 'copy', pattern: '*_dbSNP*.vcf.g*'
 
    input:
-   tuple val(chrom), path(invcf), path(invcfidx) from scattered_vcfs.flatMap().map({a -> [ (a.getSimpleName() =~ ~/_chr(\p{Alnum}+)$/)[0][1], a ]}).join(scattered_vcf_indices.flatMap().map({a -> [ (a.getSimpleName() =~ ~/_chr(\p{Alnum}+)$/)[0][1], a ]}), by: 0, failOnDuplicate: true, failOnMismatch: true)
+   tuple val(chrom), path(invcf), path(invcfidx) from scattered_vcfs.flatMap().map({a -> [ (a.getSimpleName() =~ ~/_chr(\p{Alnum}+)$/)[0][1], a ]}).filter({ !(it[0] ==~ ~/other/) }).join(scattered_vcf_indices.flatMap().map({a -> [ (a.getSimpleName() =~ ~/_chr(\p{Alnum}+)$/)[0][1], a ]}).filter({ !(it[0] ==~ ~/other/) }), by: 0, failOnDuplicate: true, failOnMismatch: true)
    path dbsnp
    path dbsnp_idx
 
@@ -557,7 +558,13 @@ process add_archaic {
    when: params.add_archaics
 
    input:
-   tuple val(chrom), path(invcf), path(invcfidx), path(arcvcf), path(arcvcfidx), path(pantrovcf), path(pantrovcfidx) from dbsnp_vcfs.filter({ params.chrom_list.tokenize(',').minus('Y').minus('MT').contains(it[0]) }).join(arc_vcfs.join(arc_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true).join(pantro_vcfs.join(pantro_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true)
+   tuple val(chrom), path(invcf), path(invcfidx), path(arcvcf), path(arcvcfidx), path(pantrovcf), path(pantrovcfidx) from dbsnp_vcfs
+      .filter({ it[0] != 'Y' && it[0] != 'chrY' && it[0] != 'MT' && it[0] != 'chrM' })
+      .join(arc_vcfs
+         .join(arc_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true)
+      .join(pantro_vcfs
+         .join(pantro_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true)
+         .filter({ it[0] != 'Y' && it[0] != 'chrY' && it[0] != 'MT' && it[0] != 'chrM' }), by: 0, failOnDuplicate: true, failOnMismatch: true)
 
    output:
    tuple path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stderr"), path("${params.run_name}_bcftools_merge_mall_archaics_PanTro_chr${chrom}.stdout") into addarc_logs
