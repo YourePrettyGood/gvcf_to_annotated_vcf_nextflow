@@ -202,6 +202,11 @@ if (params.add_archaics) {
       .filter { params.chrom_list.tokenize(',').contains(it[0]) }
       .tap { pantro_vcf_indices }
       .subscribe { println "Added ${it[1]} to pantro_vcf_indices channel" }
+} else {
+   arc_vcfs = Channel.empty()
+   arc_vcf_indices = Channel.empty()
+   pantro_vcfs = Channel.empty()
+   pantro_vcf_indices = Channel.empty()
 }
 
 process index_gvcfs {
@@ -542,6 +547,9 @@ process annotate_dbsnp {
    '''
 }
 
+//Set input to empty channel if no adding archaics:
+vcfs_to_addarc = params.add_archaics ? dbsnp_vcfs : Channel.empty()
+
 //Merge per-chromosome with the archaics:
 process add_archaic {
    tag "${chrom}"
@@ -558,7 +566,7 @@ process add_archaic {
    when: params.add_archaics
 
    input:
-   tuple val(chrom), path(invcf), path(invcfidx), path(arcvcf), path(arcvcfidx), path(pantrovcf), path(pantrovcfidx) from dbsnp_vcfs
+   tuple val(chrom), path(invcf), path(invcfidx), path(arcvcf), path(arcvcfidx), path(pantrovcf), path(pantrovcfidx) from vcfs_to_addarc
       .filter({ it[0] != 'Y' && it[0] != 'chrY' && it[0] != 'MT' && it[0] != 'chrM' })
       .join(arc_vcfs
          .join(arc_vcf_indices, by: 0, failOnDuplicate: true, failOnMismatch: true), by: 0, failOnDuplicate: true, failOnMismatch: true)
